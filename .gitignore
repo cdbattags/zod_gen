@@ -19,3 +19,6 @@ generated_types/
 
 # Examples output
 examples/generated_types/
+
+#devenv
+.devenv*
