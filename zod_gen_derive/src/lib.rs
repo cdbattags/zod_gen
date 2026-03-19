@@ -16,13 +16,38 @@ fn find_serde_rename_from_attrs(attrs: &[Attribute]) -> Option<String> {
     for attr in attrs {
         if attr.path().is_ident("serde") {
             let attr_str = quote!(#attr).to_string();
-            if let Some(rename_start) = attr_str.find("rename") {
-                let rename_part = &attr_str[rename_start..];
+            let mut search_from = 0;
+            while let Some(pos) = attr_str[search_from..].find("rename") {
+                let abs_pos = search_from + pos;
+                let after = abs_pos + "rename".len();
+                if after < attr_str.len() && attr_str.as_bytes().get(after) == Some(&b'_') {
+                    search_from = after;
+                    continue;
+                }
+                let rename_part = &attr_str[abs_pos..];
                 if let Some(quote_start) = rename_part.find('"') {
                     if let Some(quote_end) = rename_part[quote_start + 1..].find('"') {
                         let rename_value =
                             &rename_part[quote_start + 1..quote_start + 1 + quote_end];
                         return Some(rename_value.to_string());
+                    }
+                }
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn find_serde_rename_all_from_attrs(attrs: &[Attribute]) -> Option<String> {
+    for attr in attrs {
+        if attr.path().is_ident("serde") {
+            let attr_str = quote!(#attr).to_string();
+            if let Some(start) = attr_str.find("rename_all") {
+                let part = &attr_str[start..];
+                if let Some(q1) = part.find('"') {
+                    if let Some(q2) = part[q1 + 1..].find('"') {
+                        return Some(part[q1 + 1..q1 + 1 + q2].to_string());
                     }
                 }
             }
@@ -31,12 +56,113 @@ fn find_serde_rename_from_attrs(attrs: &[Attribute]) -> Option<String> {
     None
 }
 
-fn extract_serde_rename_variant(variant: &syn::Variant) -> String {
+fn split_into_words(name: &str) -> Vec<String> {
+    if name.contains('_') {
+        return name.split('_').filter(|s| !s.is_empty()).map(String::from).collect();
+    }
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = name.chars().collect();
+    for i in 0..chars.len() {
+        let ch = chars[i];
+        if ch.is_uppercase() && !current.is_empty() {
+            let prev_lower = current.chars().last().map(|c| c.is_lowercase()).unwrap_or(false);
+            let next_lower = chars.get(i + 1).map(|c| c.is_lowercase()).unwrap_or(false);
+            if prev_lower || next_lower {
+                words.push(current);
+                current = String::new();
+            }
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn apply_rename_all(name: &str, convention: &str) -> String {
+    let words = split_into_words(name);
+    match convention {
+        "snake_case" => {
+            words.iter().map(|w| w.to_lowercase()).collect::<Vec<_>>().join("_")
+        }
+        "camelCase" => {
+            let mut out = String::new();
+            for (i, w) in words.iter().enumerate() {
+                if i == 0 {
+                    out.push_str(&w.to_lowercase());
+                } else {
+                    let mut chars = w.chars();
+                    if let Some(first) = chars.next() {
+                        out.push(first.to_uppercase().next().unwrap_or(first));
+                        for c in chars {
+                            out.extend(c.to_lowercase());
+                        }
+                    }
+                }
+            }
+            out
+        }
+        "PascalCase" => {
+            let mut out = String::new();
+            for w in &words {
+                let mut chars = w.chars();
+                if let Some(first) = chars.next() {
+                    out.push(first.to_uppercase().next().unwrap_or(first));
+                    for c in chars {
+                        out.extend(c.to_lowercase());
+                    }
+                }
+            }
+            out
+        }
+        "kebab-case" => {
+            words.iter().map(|w| w.to_lowercase()).collect::<Vec<_>>().join("-")
+        }
+        "SCREAMING_SNAKE_CASE" => {
+            words.iter().map(|w| w.to_uppercase()).collect::<Vec<_>>().join("_")
+        }
+        "SCREAMING-KEBAB-CASE" => {
+            words.iter().map(|w| w.to_uppercase()).collect::<Vec<_>>().join("-")
+        }
+        "lowercase" => name.to_lowercase(),
+        "UPPERCASE" => name.to_uppercase(),
+        _ => name.to_string(),
+    }
+}
+
+fn extract_serde_rename_variant(variant: &syn::Variant, rename_all: Option<&str>) -> String {
     if let Some(rename_value) = find_serde_rename_from_attrs(&variant.attrs) {
         rename_value
+    } else if let Some(convention) = rename_all {
+        apply_rename_all(&variant.ident.to_string(), convention)
     } else {
         variant.ident.to_string()
     }
+}
+
+fn resolve_field_name(field: &syn::Field, rename_all: Option<&str>) -> String {
+    let ident = field.ident.as_ref().unwrap();
+    if let Some(rename_value) = find_serde_rename_from_attrs(&field.attrs) {
+        rename_value
+    } else if let Some(convention) = rename_all {
+        apply_rename_all(&ident.to_string(), convention)
+    } else {
+        ident.to_string()
+    }
+}
+
+fn has_serde_default(attrs: &[Attribute]) -> bool {
+    for attr in attrs {
+        if attr.path().is_ident("serde") {
+            let attr_str = quote!(#attr).to_string();
+            if attr_str.contains("default") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn find_serde_tag_from_attrs(attrs: &[Attribute]) -> Option<String> {
@@ -120,13 +246,19 @@ pub fn derive_zod_schema(input: TokenStream) -> TokenStream {
     let expanded = match input.data {
         Data::Struct(data_struct) => match data_struct.fields {
             Fields::Named(fields_named) => {
+                let struct_rename_all = find_serde_rename_all_from_attrs(&input.attrs);
+                let struct_ra = struct_rename_all.as_deref();
                 let fields = fields_named.named.iter().map(|f| {
                     let ident = f.ident.as_ref().unwrap();
-                    let ident_name =
-                        find_serde_rename_from_attrs(&f.attrs).unwrap_or_else(|| ident.to_string());
+                    let ident_name = resolve_field_name(f, struct_ra);
                     let field_name = LitStr::new(&ident_name, ident.span());
                     let ty = &f.ty;
-                    quote! { (#field_name, <#ty as zod_gen::ZodSchema>::zod_schema().as_str()) }
+                    let is_default = has_serde_default(&f.attrs);
+                    if is_default {
+                        quote! { (#field_name, format!("{}.optional()", <#ty as zod_gen::ZodSchema>::zod_schema()).as_str()) }
+                    } else {
+                        quote! { (#field_name, <#ty as zod_gen::ZodSchema>::zod_schema().as_str()) }
+                    }
                 });
                 quote! {
                     impl zod_gen::ZodSchema for #name {
@@ -148,6 +280,8 @@ pub fn derive_zod_schema(input: TokenStream) -> TokenStream {
         Data::Enum(data_enum) => {
             let representation = parse_enum_serde_attrs(&input.attrs)
                 .expect("Failed to parse serde enum attributes");
+            let enum_rename_all = find_serde_rename_all_from_attrs(&input.attrs);
+            let enum_ra = enum_rename_all.as_deref();
 
             match representation {
                 EnumRepresentation::ExternallyTagged => {
@@ -161,7 +295,7 @@ pub fn derive_zod_schema(input: TokenStream) -> TokenStream {
                             .variants
                             .iter()
                             .map(|v| {
-                                let renamed = extract_serde_rename_variant(v);
+                                let renamed = extract_serde_rename_variant(v, enum_ra);
                                 let lit = LitStr::new(&renamed, v.ident.span());
                                 quote! { zod_gen::zod_literal(#lit) }
                             })
@@ -177,7 +311,7 @@ pub fn derive_zod_schema(input: TokenStream) -> TokenStream {
                         }
                     } else {
                         let variant_schemas: Vec<proc_macro2::TokenStream> = data_enum.variants.iter().map(|v| {
-                            let renamed = extract_serde_rename_variant(v);
+                            let renamed = extract_serde_rename_variant(v, enum_ra);
                             let var_lit = LitStr::new(&renamed, v.ident.span());
 
                             match &v.fields {
@@ -217,7 +351,11 @@ pub fn derive_zod_schema(input: TokenStream) -> TokenStream {
                                             .unwrap_or_else(|| ident.to_string());
                                         let name_lit = LitStr::new(&field_name, ident.span());
                                         let field_ty = &f.ty;
-                                        quote! { (#name_lit, <#field_ty as zod_gen::ZodSchema>::zod_schema().as_str()) }
+                                        if has_serde_default(&f.attrs) {
+                                            quote! { (#name_lit, format!("{}.optional()", <#field_ty as zod_gen::ZodSchema>::zod_schema()).as_str()) }
+                                        } else {
+                                            quote! { (#name_lit, <#field_ty as zod_gen::ZodSchema>::zod_schema().as_str()) }
+                                        }
                                     }).collect();
                                     quote! {
                                         {
@@ -262,7 +400,7 @@ pub fn derive_zod_schema(input: TokenStream) -> TokenStream {
                     }
 
                     let variant_schemas: Vec<proc_macro2::TokenStream> = data_enum.variants.iter().map(|v| {
-                        let renamed = extract_serde_rename_variant(v);
+                        let renamed = extract_serde_rename_variant(v, enum_ra);
                         let var_lit = LitStr::new(&renamed, v.ident.span());
 
                         match &v.fields {
@@ -303,7 +441,11 @@ pub fn derive_zod_schema(input: TokenStream) -> TokenStream {
                                         .unwrap_or_else(|| ident.to_string());
                                     let name_lit = LitStr::new(&field_name, ident.span());
                                     let field_ty = &f.ty;
-                                    quote! { (#name_lit, <#field_ty as zod_gen::ZodSchema>::zod_schema().as_str()) }
+                                    if has_serde_default(&f.attrs) {
+                                        quote! { (#name_lit, format!("{}.optional()", <#field_ty as zod_gen::ZodSchema>::zod_schema()).as_str()) }
+                                    } else {
+                                        quote! { (#name_lit, <#field_ty as zod_gen::ZodSchema>::zod_schema().as_str()) }
+                                    }
                                 }).collect();
                                 quote! {
                                     {
@@ -330,7 +472,7 @@ pub fn derive_zod_schema(input: TokenStream) -> TokenStream {
                     let content_lit = LitStr::new(&content, name_span);
 
                     let variant_schemas: Vec<proc_macro2::TokenStream> = data_enum.variants.iter().map(|v| {
-                        let renamed = extract_serde_rename_variant(v);
+                        let renamed = extract_serde_rename_variant(v, enum_ra);
                         let var_lit = LitStr::new(&renamed, v.ident.span());
 
                         match &v.fields {
@@ -370,7 +512,11 @@ pub fn derive_zod_schema(input: TokenStream) -> TokenStream {
                                         .unwrap_or_else(|| ident.to_string());
                                     let name_lit = LitStr::new(&field_name, ident.span());
                                     let field_ty = &f.ty;
-                                    quote! { (#name_lit, <#field_ty as zod_gen::ZodSchema>::zod_schema().as_str()) }
+                                    if has_serde_default(&f.attrs) {
+                                        quote! { (#name_lit, format!("{}.optional()", <#field_ty as zod_gen::ZodSchema>::zod_schema()).as_str()) }
+                                    } else {
+                                        quote! { (#name_lit, <#field_ty as zod_gen::ZodSchema>::zod_schema().as_str()) }
+                                    }
                                 }).collect();
                                 quote! {
                                     {
@@ -422,7 +568,11 @@ pub fn derive_zod_schema(input: TokenStream) -> TokenStream {
                                         .unwrap_or_else(|| ident.to_string());
                                     let name_lit = LitStr::new(&field_name, ident.span());
                                     let field_ty = &f.ty;
-                                    quote! { (#name_lit, <#field_ty as zod_gen::ZodSchema>::zod_schema().as_str()) }
+                                    if has_serde_default(&f.attrs) {
+                                        quote! { (#name_lit, format!("{}.optional()", <#field_ty as zod_gen::ZodSchema>::zod_schema()).as_str()) }
+                                    } else {
+                                        quote! { (#name_lit, <#field_ty as zod_gen::ZodSchema>::zod_schema().as_str()) }
+                                    }
                                 }).collect();
                                 quote! {
                                     zod_gen::zod_object(&[#(#inner_fields),*])
