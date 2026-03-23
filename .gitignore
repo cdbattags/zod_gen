@@ -22,3 +22,6 @@ examples/generated_types/
 
 #devenv
 .devenv*
+
+# SurrealDB REPL history
+history.txt
